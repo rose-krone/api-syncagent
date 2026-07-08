@@ -33,7 +33,6 @@ import (
 	syncagentv1alpha1 "github.com/kcp-dev/api-syncagent/sdk/apis/syncagent/v1alpha1"
 
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -57,15 +56,15 @@ type Reconciler struct {
 	// also triggered.
 	ctx context.Context
 
-	localManager    manager.Manager
-	dmcm            *kcp.DynamicMultiClusterManager
-	log             *zap.SugaredLogger
-	recorder        record.EventRecorder
-	discoveryClient *discovery.Client
-	resourceProber  *discovery.ResourceProber
-	prFilter        labels.Selector
-	stateNamespace  string
-	agentName       string
+	localManager          manager.Manager
+	dmcm                  *kcp.DynamicMultiClusterManager
+	log                   *zap.SugaredLogger
+	discoveryClient       *discovery.Client
+	resourceProber        *discovery.ResourceProber
+	prFilter              labels.Selector
+	stateNamespace        string
+	agentName             string
+	enableServerSideApply bool
 
 	syncCancelsLock sync.RWMutex
 	// A map of sync controllers, one for each PublishedResource, using their
@@ -84,6 +83,7 @@ func Add(
 	prFilter labels.Selector,
 	stateNamespace string,
 	agentName string,
+	enableServerSideApply bool,
 ) error {
 	discoveryClient, err := discovery.NewClient(localManager.GetConfig())
 	if err != nil {
@@ -91,18 +91,18 @@ func Add(
 	}
 
 	reconciler := &Reconciler{
-		ctx:             ctx,
-		localManager:    localManager,
-		dmcm:            dmcm,
-		log:             log,
-		recorder:        localManager.GetEventRecorderFor(ControllerName), //nolint:staticcheck // https://github.com/kcp-dev/api-syncagent/issues/157
-		discoveryClient: discoveryClient,
-		prFilter:        prFilter,
-		stateNamespace:  stateNamespace,
-		agentName:       agentName,
-		resourceProber:  resourceProber,
-		syncCancelsLock: sync.RWMutex{},
-		syncCancels:     map[string]context.CancelCauseFunc{},
+		ctx:                   ctx,
+		localManager:          localManager,
+		dmcm:                  dmcm,
+		log:                   log,
+		discoveryClient:       discoveryClient,
+		prFilter:              prFilter,
+		stateNamespace:        stateNamespace,
+		agentName:             agentName,
+		resourceProber:        resourceProber,
+		enableServerSideApply: enableServerSideApply,
+		syncCancelsLock:       sync.RWMutex{},
+		syncCancels:           map[string]context.CancelCauseFunc{},
 	}
 
 	bldr := builder.
@@ -188,6 +188,7 @@ func (r *Reconciler) ensureSyncController(ctx context.Context, log *zap.SugaredL
 		r.discoveryClient,
 		r.stateNamespace,
 		r.agentName,
+		r.enableServerSideApply,
 		r.log,
 		numSyncWorkers,
 	)
