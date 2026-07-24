@@ -26,6 +26,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/record"
+	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // fakeStateStore is a minimal ObjectStateStore for unit tests.
@@ -220,4 +221,81 @@ func TestSyncObjectContentsForwardStatusRunsEvenOnSpecRequeue(t *testing.T) {
 	if phase != "ready" {
 		t.Errorf("expected dest status.phase=ready after syncObjectContents, got %q — forward status sync did not run on spec requeue", phase)
 	}
+}
+
+func TestEnsureDestMetadataPersisted(t *testing.T) {
+	log := zap.NewNop().Sugar()
+
+	makeCopy := func() *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion("test.example.com/v1")
+		obj.SetKind("Widget")
+		obj.SetName("my-widget")
+		obj.SetNamespace("default")
+		return obj
+	}
+
+	destLabels := map[string]string{
+		relatedOwnerLabel:      "testcluster",
+		relatedIdentifierLabel: "credentials",
+	}
+	destAnnotations := map[string]string{
+		relatedPrimaryNameAnnotation: "my-primary",
+	}
+
+	t.Run("backfills provenance metadata onto a pre-existing copy and is idempotent", func(t *testing.T) {
+		// A copy that predates the feature: it exists on the destination but carries none of the
+		// provenance labels/annotations the prune relies on.
+		dest := makeCopy()
+		destClient := buildFakeClient(dest)
+
+		syncer := &objectSyncer{destLabels: destLabels, destAnnotations: destAnnotations}
+		destSide := syncSide{object: dest, client: destClient}
+
+		updated, err := syncer.ensureDestMetadataPersisted(t.Context(), log, destSide)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !updated {
+			t.Fatal("expected updated=true because the copy was missing the provenance metadata")
+		}
+
+		// The change must be persisted to the API, not just to the in-memory object.
+		persisted := makeCopy()
+		if err := destClient.Get(t.Context(), ctrlruntimeclient.ObjectKeyFromObject(dest), persisted); err != nil {
+			t.Fatalf("failed to get persisted object: %v", err)
+		}
+		for k, v := range destLabels {
+			if persisted.GetLabels()[k] != v {
+				t.Errorf("expected persisted label %q=%q, got %q", k, v, persisted.GetLabels()[k])
+			}
+		}
+		if persisted.GetAnnotations()[relatedPrimaryNameAnnotation] != "my-primary" {
+			t.Errorf("expected persisted annotation, got %q", persisted.GetAnnotations()[relatedPrimaryNameAnnotation])
+		}
+
+		// A second call must be a no-op now that the metadata is present.
+		updated, err = syncer.ensureDestMetadataPersisted(t.Context(), log, syncSide{object: persisted, client: destClient})
+		if err != nil {
+			t.Fatalf("unexpected error on second call: %v", err)
+		}
+		if updated {
+			t.Error("expected updated=false on the second call (idempotent), but got true")
+		}
+	})
+
+	t.Run("no-op when the syncer has no additional destination metadata", func(t *testing.T) {
+		dest := makeCopy()
+		destClient := buildFakeClient(dest)
+
+		syncer := &objectSyncer{}
+
+		updated, err := syncer.ensureDestMetadataPersisted(t.Context(), log, syncSide{object: dest, client: destClient})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if updated {
+			t.Error("expected updated=false when there are no destLabels/destAnnotations")
+		}
+	})
 }

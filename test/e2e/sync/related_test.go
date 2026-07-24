@@ -1754,10 +1754,14 @@ func compareSecrets(t *testing.T, actual, expected corev1.Secret) error {
 }
 
 func compareUnstructured(actual, expected *unstructured.Unstructured) error {
-	// ensure the secret in kcp does not have any sync-related metadata
+	// ensure the copy does not have any sync-related metadata: the internal kcp claim labels, the
+	// cluster annotation, and the agent's own provenance metadata (the agent-name label plus the
+	// related-resource ownership labels/annotations the agent stamps on every copy so it can
+	// enumerate them for pruning). None of these are part of the object's meaningful content.
 	labels := actual.GetLabels()
 	maps.DeleteFunc(labels, func(k, v string) bool {
-		return strings.HasPrefix(k, "claimed.internal.apis.kcp.io/")
+		return strings.HasPrefix(k, "claimed.internal.apis.kcp.io/") ||
+			strings.HasPrefix(k, "syncagent.kcp.io/")
 	})
 	if len(labels) == 0 {
 		labels = nil
@@ -1766,6 +1770,9 @@ func compareUnstructured(actual, expected *unstructured.Unstructured) error {
 
 	annotations := actual.GetAnnotations()
 	delete(annotations, "kcp.io/cluster")
+	maps.DeleteFunc(annotations, func(k, v string) bool {
+		return strings.HasPrefix(k, "syncagent.kcp.io/")
+	})
 	if len(annotations) == 0 {
 		annotations = nil
 	}

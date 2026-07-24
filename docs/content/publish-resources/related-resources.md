@@ -571,3 +571,60 @@ individually. For each namespace it will again follow the configured source, may
 template or reference. If again a label selector is used, it will be applied in each namespace and
 the configured rewrite rule will be evaluated once per found object. In this case, `.Value` is the
 name of found object.
+
+## Cleanup
+
+By default the agent only ever _creates_ copies of related resources; it never deletes them. This
+is intentional: copies can be useful as audit trails, may have decoupled lifecycles, or may be owned
+by the service provider. The behavior is controlled per related resource via the `cleanupPolicy`
+field, which takes one of three values:
+
+- `Orphan` (default): copies are never deleted by the agent.
+- `OnPrimaryDeletion`: copies are deleted only when the primary object is deleted.
+- `MatchOrigin`: the destination set is kept equal to the origin set — a copy is pruned as soon as
+  its origin object no longer exists, and all copies are deleted when the primary object is deleted.
+
+**The original object on the origin side is never deleted, under any policy.** The agent only ever
+deletes destination copies that it created itself (they carry provenance labels identifying the
+owning primary object); hand-created objects are never touched.
+
+`MatchOrigin` prunes copies while the agent reconciles the primary object. For an `origin: service`
+related resource this means a `watch` must be configured, otherwise a deleted source object would
+only be noticed on the next incidental reconcile of the primary. The CRD enforces this: setting
+`cleanupPolicy: MatchOrigin` together with `origin: service` requires a `watch` block.
+
+{% raw %}
+```yaml
+apiVersion: syncagent.kcp.io/v1alpha1
+kind: PublishedResource
+metadata:
+  name: publish-crontabs
+spec:
+  resource:
+    apiGroup: example.com
+    version: v1
+    kind: CronTab
+  related:
+    - identifier: credentials
+      origin: service
+      kind: Secret
+      cleanupPolicy: MatchOrigin
+      object:
+        selector:
+          matchLabels:
+            app: credentials
+          rewrite:
+            template:
+              template: "{{ .Value }}"
+      watch:
+        bySelector:
+          matchLabels:
+            example.com/managed: "true"
+```
+{% endraw %}
+
+!!! note
+    The deprecated boolean `cleanup` field still works for backwards compatibility. When
+    `cleanupPolicy` is not set, `cleanup: true` is treated as `OnPrimaryDeletion` and `cleanup: false`
+    (or unset) as `Orphan`. New configurations should use `cleanupPolicy` instead; setting
+    `cleanup: true` together with `cleanupPolicy: Orphan` is rejected as a contradiction.

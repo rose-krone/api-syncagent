@@ -53,6 +53,26 @@ const (
 	// full annotation name, the annotation value is a JSON string containing GVK and
 	// metadata of the related object.
 	relatedObjectAnnotationPrefix = "related-resources.syncagent.kcp.io/"
+
+	// The following label/annotations are put on the destination copies of related resources to
+	// link them back to their owning primary object and the related resource identifier. They allow
+	// the agent to List all copies belonging to a specific primary + identifier so that it can prune
+	// copies whose origin object no longer exists (cleanupPolicy: MatchOrigin) or delete all copies
+	// on primary teardown.
+	//
+	// The owner tuple — the primary's logical cluster (workspace), the owning PublishedResource and
+	// the primary's namespace/name — is hashed into a single related-owner label. The destination is
+	// shared across all kcp workspaces and all PublishedResources, so all of these dimensions must be
+	// part of the identity; folding them into one hash makes that uniqueness inherent in the hash
+	// input and keeps the value a valid label regardless of the source lengths or characters. The
+	// identifier and agent name are already valid label values and are kept verbatim (and queryable);
+	// the plaintext primary name/namespace are kept as annotations for humans.
+
+	relatedOwnerLabel      = "syncagent.kcp.io/related-owner"
+	relatedIdentifierLabel = "syncagent.kcp.io/related-identifier"
+
+	relatedPrimaryNamespaceAnnotation = "syncagent.kcp.io/related-primary-namespace"
+	relatedPrimaryNameAnnotation      = "syncagent.kcp.io/related-primary-name"
 )
 
 func OwnedBy(obj ctrlruntimeclient.Object, agentName string) bool {

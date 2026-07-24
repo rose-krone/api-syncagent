@@ -387,7 +387,26 @@ spec:
                           the destination side (i.e. the original related object will not be touched, regardless of this
                           option). Leaving this disabled, the syncagent will only create copies of the related objects,
                           but never delete them itself.
+
+                          Deprecated: use CleanupPolicy instead. When CleanupPolicy is empty, cleanup:true is treated
+                          as OnPrimaryDeletion and cleanup:false as Orphan.
                         type: boolean
+                      cleanupPolicy:
+                        description: |-
+                          CleanupPolicy controls when the syncagent deletes destination copies of this related
+                          resource. The original object on the origin side is never deleted.
+
+                            - Orphan (default): copies are never deleted by the agent.
+                            - OnPrimaryDeletion: copies are deleted only when the primary object is deleted.
+                            - MatchOrigin: copies are pruned as soon as their origin object no longer exists, and
+                              all copies are deleted when the primary object is deleted.
+
+                          When left empty, the deprecated Cleanup field is used to derive the effective policy.
+                        enum:
+                          - Orphan
+                          - OnPrimaryDeletion
+                          - MatchOrigin
+                        type: string
                       group:
                         description: |-
                           Group is the API group of the related resource. This should be left blank for resources
@@ -398,7 +417,13 @@ spec:
                           Identifier is a unique name for this related resource. The name must be unique within one
                           PublishedResource and is the key by which consumers (end users) can identify and consume the
                           related resource. Common names are "connection-details" or "credentials".
-                          The identifier must be an alphanumeric string.
+
+                          The identifier is used verbatim as a label value on the synced copies of the related resource,
+                          so it must be a valid label value: a lowercase RFC 1123 label consisting of lowercase
+                          alphanumeric characters or '-', starting and ending with an alphanumeric character, and at
+                          most 63 characters long.
+                        maxLength: 63
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       identityHash:
                         description: |-
@@ -878,6 +903,10 @@ spec:
                         rule: '!has(self.identityHash) || (has(self.group) && has(self.version) && has(self.resource))'
                       - message: watch must be configured when origin is service and syncStatus is true
                         rule: '!(self.origin == ''service'' && has(self.syncStatus) && self.syncStatus) || has(self.watch)'
+                      - message: watch must be configured when cleanupPolicy is MatchOrigin and origin is service
+                        rule: '!(has(self.cleanupPolicy) && self.cleanupPolicy == ''MatchOrigin'' && self.origin == ''service'') || has(self.watch)'
+                      - message: 'cleanup:true conflicts with cleanupPolicy: Orphan'
+                        rule: '!(has(self.cleanup) && self.cleanup && has(self.cleanupPolicy) && self.cleanupPolicy == ''Orphan'')'
                   type: array
                 resource:
                   description: |-

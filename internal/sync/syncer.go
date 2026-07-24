@@ -46,6 +46,13 @@ type ResourceSyncer struct {
 	localCRD     *apiextensionsv1.CustomResourceDefinition
 	subresources []string
 
+	// localAPIReader and remoteAPIReader are uncached readers that hit the API server directly.
+	// They are only used to re-confirm a cache-driven empty related-resource resolution before a
+	// MatchOrigin prune would delete every copy (see processRelatedResource). They may be nil, in
+	// which case that destructive full-set prune is skipped rather than run on unverified data.
+	localAPIReader  ctrlruntimeclient.Reader
+	remoteAPIReader ctrlruntimeclient.Reader
+
 	destDummy *unstructured.Unstructured
 
 	// cached mutators (for those transformers that are expensive to compile, like CEL)
@@ -66,6 +73,17 @@ type ResourceSyncerOption func(*ResourceSyncer)
 func WithServerSideApply() ResourceSyncerOption {
 	return func(r *ResourceSyncer) {
 		r.useServerSideApply = true
+	}
+}
+
+// WithLiveReaders configures uncached readers for the local (service cluster) and remote (kcp)
+// sides. They let a MatchOrigin prune re-confirm an empty origin resolution against the API server
+// before deleting all copies of a related resource, guarding against a stale/relisting informer
+// cache. Either reader may be nil.
+func WithLiveReaders(local, remote ctrlruntimeclient.Reader) ResourceSyncerOption {
+	return func(r *ResourceSyncer) {
+		r.localAPIReader = local
+		r.remoteAPIReader = remote
 	}
 }
 

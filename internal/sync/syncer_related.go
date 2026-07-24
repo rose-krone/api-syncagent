@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -36,7 +37,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -80,15 +84,13 @@ func (s *ResourceSyncer) processRelatedResource(ctx context.Context, log *zap.Su
 		eventObjSide = syncSideSource
 	}
 
+	// normalize the deprecated cleanup bool and the cleanup policy field into a single policy.
+	policy := relRes.EffectiveCleanupPolicy()
+
 	// find the all objects on the origin side that match the given criteria
 	resolvedObjects, err := resolveRelatedResourceObjects(ctx, origin, dest, relRes)
 	if err != nil {
 		return false, fmt.Errorf("failed to get resolve origin objects: %w", err)
-	}
-
-	// no objects were found yet, that's okay
-	if len(resolvedObjects) == 0 {
-		return false, nil
 	}
 
 	slices.SortStableFunc(resolvedObjects, func(a, b resolvedObject) int {
@@ -106,7 +108,27 @@ func (s *ResourceSyncer) processRelatedResource(ctx context.Context, log *zap.Su
 		return false, fmt.Errorf("failed to lookup %v: %w", projectedGVR, err)
 	}
 
-	for idx, resolved := range resolvedObjects {
+	// The primary object (always the kcp side) owns these related copies; stamp its coordinates
+	// onto every copy so that all copies of this (primary, identifier) can be enumerated later to
+	// prune stale copies or tear them all down.
+	primary := remote.object
+	destLabels := relatedCopyLabels(primary, remote.clusterName, s.pubRes.Name, relRes.Identifier, s.agentName)
+	destAnnotations := relatedCopyAnnotations(primary)
+
+	// remember which destination copies we (re)synced this pass, so a MatchOrigin prune can delete
+	// the copies that no longer have a matching origin object.
+	synced := sets.New[string]()
+
+	// We "forward" the deletion to the related objects only if the primary is already in deletion
+	// and the related object either originated from the user (so on the service cluster we just
+	// have a useless copy once the main object has been cleared up) OR the admin explicitly opted
+	// into a cleanup policy that removes copies on primary deletion.
+	forceDelete := primaryDeleting &&
+		(policy == syncagentv1alpha1.RelatedResourceCleanupPolicyOnPrimaryDeletion ||
+			policy == syncagentv1alpha1.RelatedResourceCleanupPolicyMatchOrigin ||
+			relRes.Origin == syncagentv1alpha1.RelatedResourceOriginKcp)
+
+	for _, resolved := range resolvedObjects {
 		destObject := &unstructured.Unstructured{}
 		destObject.SetAPIVersion(projectedGVK.GroupVersion().String())
 		destObject.SetKind(projectedGVK.Kind)
@@ -126,12 +148,6 @@ func (s *ResourceSyncer) processRelatedResource(ctx context.Context, log *zap.Su
 			client:      dest.client,
 			object:      destObject,
 		}
-
-		// We "forward" the deletion to the related objects only if the primary is already in deletion
-		// and the related object either originated from the user (so on the service cluster we just
-		// have a useless copy once the main object has been cleared up) OR the admin explicitly opted
-		// into the cleanup procedure to ensure that copies of the related object are removed.
-		forceDelete := primaryDeleting && (relRes.Cleanup || relRes.Origin == syncagentv1alpha1.RelatedResourceOriginKcp)
 
 		// When status sync is enabled, include "status" in subresources so it is stripped from
 		// the spec patch (avoiding a no-op write on resources that have a status subresource).
@@ -169,6 +185,9 @@ func (s *ResourceSyncer) processRelatedResource(ctx context.Context, log *zap.Su
 			mutator: s.relatedMutators[relRes.Identifier],
 			// we never want to store sync-related metadata inside kcp
 			metadataOnDestination: false,
+			// stamp owning-primary provenance so that the copies can be enumerated for pruning.
+			destLabels:      destLabels,
+			destAnnotations: destAnnotations,
 			// events are always created on the kcp side
 			eventObjSide: eventObjSide,
 			// force deletion of related resources when the primary object is being deleted
@@ -188,46 +207,284 @@ func (s *ResourceSyncer) processRelatedResource(ctx context.Context, log *zap.Su
 		// too many unnecessary requeues.
 		requeue = requeue || req
 
-		// now that the related object was successfully synced, we can remember its details on the
-		// main object
-		if relRes.Origin == syncagentv1alpha1.RelatedResourceOriginService {
-			// TODO: Improve this logic, the added index is just a hack until we find a better solution
-			// to let the user know about the related object (this annotation is not relevant for the
-			// syncing logic, it's purely for the end-user).
-			annotation := fmt.Sprintf("%s%s.%d", relatedObjectAnnotationPrefix, relRes.Identifier, idx)
+		synced.Insert(relatedCopyKey(resolved.destination.Namespace, resolved.destination.Name))
+	}
 
-			value, err := json.Marshal(relatedObjectAnnotation{
-				Namespace:  resolved.destination.Namespace,
-				Name:       resolved.destination.Name,
-				APIVersion: resolved.original.GetAPIVersion(),
-				Kind:       resolved.original.GetKind(),
-			})
+	// Remember the related objects on the primary object for the end-user. This is rebuilt from the
+	// freshly-resolved set so entries for objects that no longer resolve are dropped; a fully-empty
+	// resolution is left untouched (see rememberRelatedObjects) to avoid churning the primary.
+	if relRes.Origin == syncagentv1alpha1.RelatedResourceOriginService {
+		annRequeue, err := s.rememberRelatedObjects(ctx, log, remote, relRes.Identifier, resolvedObjects)
+		if err != nil {
+			return false, err
+		}
+
+		// we updated the main object, so we requeue immediately because successive patches would
+		// fail anyway; the prune below then runs on the next reconciliation.
+		if annRequeue {
+			return true, nil
+		}
+	}
+
+	// Prune / teardown destination copies as configured. Only objects carrying our provenance
+	// labels are ever considered, and we only ever act on the destination client, so the original
+	// origin-side objects are never touched.
+	switch {
+	case primaryDeleting && (policy == syncagentv1alpha1.RelatedResourceCleanupPolicyOnPrimaryDeletion ||
+		policy == syncagentv1alpha1.RelatedResourceCleanupPolicyMatchOrigin):
+		// On primary teardown, delete ALL labelled copies. This is a superset of the per-object
+		// deletion performed in the loop above and additionally reclaims copies whose origin object
+		// had already disappeared mid-life (which the loop can no longer resolve).
+		selector := relatedCopySelector(primary, remote.clusterName, s.pubRes.Name, relRes.Identifier, s.agentName)
+
+		pruneRequeue, err := s.pruneRelatedCopies(ctx, log, dest, primary, projectedGVK, selector, nil, true)
+		if err != nil {
+			return false, fmt.Errorf("failed to tear down related copies: %w", err)
+		}
+
+		requeue = requeue || pruneRequeue
+
+	case !primaryDeleting && policy == syncagentv1alpha1.RelatedResourceCleanupPolicyMatchOrigin:
+		// Keep the destination set equal to the origin set: prune every labelled copy whose origin
+		// object was not resolved this pass.
+		selector := relatedCopySelector(primary, remote.clusterName, s.pubRes.Name, relRes.Identifier, s.agentName)
+
+		// A fully-empty resolution here would prune *every* copy at once, because the keep set is
+		// empty. resolvedObjects comes from a cache-backed read, and a relisting or otherwise stale
+		// informer -- notably a kcp virtual-workspace cache -- can momentarily return nothing even
+		// though the origin objects still exist. Acting on that would delete and then immediately
+		// recreate all copies, disrupting consumers (e.g. Secrets mounted by workloads). The
+		// non-destructive annotation bookkeeping already refuses to act on an empty resolution for
+		// the same reason (see rememberRelatedObjects); the destructive prune must be at least as
+		// careful. Before deleting the whole set, re-confirm the emptiness against a live read; if
+		// the live read disagrees, requeue and let the cache converge. A genuinely empty origin is
+		// still pruned, so the single-object mid-life case the feature promises keeps working.
+		//
+		// Partial under-resolution (a non-empty but incomplete set) is intentionally not guarded:
+		// it prunes at most a subset and self-heals on the next pass, matching the cache semantics
+		// the rest of the sync already relies on.
+		if len(resolvedObjects) == 0 {
+			confirmedEmpty, checked, err := s.confirmOriginEmpty(ctx, origin, dest, relRes)
 			if err != nil {
-				return false, fmt.Errorf("failed to encode related object annotation: %w", err)
+				return false, fmt.Errorf("failed to confirm empty origin before pruning related copies: %w", err)
 			}
 
-			annotations := remote.object.GetAnnotations()
-			existing := annotations[annotation]
+			switch {
+			case !checked:
+				// No live reader configured to confirm against (e.g. in unit tests). Do not risk
+				// deleting the whole set on an unverified empty resolution; teardown still reclaims
+				// the copies if the primary is ever deleted.
+				log.Debug("Skipping full related-copy prune on empty resolution: no live reader configured to confirm it.")
+				return requeue, nil
 
-			if existing != string(value) {
-				oldState := remote.object.DeepCopy()
-
-				annotations[annotation] = string(value)
-				remote.object.SetAnnotations(annotations)
-
-				log.Debug("Remembering related object in main object…")
-				if err := remote.client.Patch(ctx, remote.object, ctrlruntimeclient.MergeFrom(oldState)); err != nil {
-					return false, fmt.Errorf("failed to update related data in remote object: %w", err)
-				}
-
-				// requeue (since this updated the main object, we do actually want to
-				// requeue immediately because successive patches would fail anyway)
+			case !confirmedEmpty:
+				log.Warn("Skipping related-copy prune: origin resolved to no objects from cache, but a live read still sees origin objects; requeueing to let the cache converge.")
 				return true, nil
+			}
+		}
+
+		pruneRequeue, err := s.pruneRelatedCopies(ctx, log, dest, primary, projectedGVK, selector, synced, false)
+		if err != nil {
+			return false, fmt.Errorf("failed to prune related copies: %w", err)
+		}
+
+		requeue = requeue || pruneRequeue
+	}
+
+	return requeue, nil
+}
+
+// relatedCopyKey builds the namespace/name key used to track and match destination copies.
+func relatedCopyKey(namespace, name string) string {
+	return namespace + "/" + name
+}
+
+// rememberRelatedObjects writes the human-facing provenance annotations onto the primary object,
+// one per related copy (indexed). It rebuilds the full set for the given identifier from the
+// currently resolved objects, so annotations for objects that are no longer resolved are removed and
+// do not accumulate. It reports requeue=true when it patched the primary object.
+func (s *ResourceSyncer) rememberRelatedObjects(ctx context.Context, log *zap.SugaredLogger, remote syncSide, identifier string, resolvedObjects []resolvedObject) (requeue bool, err error) {
+	// When nothing resolves there is nothing new to remember, and we deliberately do not treat this
+	// as "clear all annotations for this identifier". These annotations are purely informational and
+	// the prune is the authoritative cleanup for the copies themselves; wiping them on every empty
+	// pass would otherwise churn the primary object with patches and requeues for all cleanup
+	// policies, not just the pruning ones (this used to be avoided by an early return before the
+	// resolved set was allowed to be empty so the prune could run).
+	if len(resolvedObjects) == 0 {
+		return false, nil
+	}
+
+	// TODO: Improve this logic, the added index is just a hack until we find a better solution to
+	// let the user know about the related object (this annotation is not relevant for the syncing
+	// logic, it's purely for the end-user).
+	prefix := fmt.Sprintf("%s%s.", relatedObjectAnnotationPrefix, identifier)
+
+	desired := map[string]string{}
+	for idx, resolved := range resolvedObjects {
+		value, err := json.Marshal(relatedObjectAnnotation{
+			Namespace:  resolved.destination.Namespace,
+			Name:       resolved.destination.Name,
+			APIVersion: resolved.original.GetAPIVersion(),
+			Kind:       resolved.original.GetKind(),
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to encode related object annotation: %w", err)
+		}
+
+		desired[fmt.Sprintf("%s%d", prefix, idx)] = string(value)
+	}
+
+	annotations := remote.object.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+
+	// determine whether the existing annotations for this identifier already match the desired set.
+	changed := false
+	for key := range annotations {
+		if strings.HasPrefix(key, prefix) {
+			if _, ok := desired[key]; !ok {
+				changed = true
+				break
+			}
+		}
+	}
+	if !changed {
+		for key, value := range desired {
+			if annotations[key] != value {
+				changed = true
+				break
 			}
 		}
 	}
 
+	if !changed {
+		return false, nil
+	}
+
+	oldState := remote.object.DeepCopy()
+
+	// drop all existing entries for this identifier, then add the freshly computed ones.
+	for key := range annotations {
+		if strings.HasPrefix(key, prefix) {
+			delete(annotations, key)
+		}
+	}
+	maps.Copy(annotations, desired)
+	remote.object.SetAnnotations(annotations)
+
+	log.Debug("Remembering related objects in main object…")
+	if err := remote.client.Patch(ctx, remote.object, ctrlruntimeclient.MergeFrom(oldState)); err != nil {
+		return false, fmt.Errorf("failed to update related data in remote object: %w", err)
+	}
+
+	return true, nil
+}
+
+// pruneRelatedCopies lists the destination copies matching the given (primary + identifier + agent)
+// selector and deletes those that are no longer wanted. When deleteAll is true, every matching copy
+// is deleted (primary teardown); otherwise only copies whose key is not in the keep set are deleted
+// (mid-life prune). It only ever operates on the destination client, so origin objects are never
+// touched, and it only ever sees objects that carry our provenance labels, so hand-created objects
+// are never in scope.
+func (s *ResourceSyncer) pruneRelatedCopies(ctx context.Context, log *zap.SugaredLogger, dest syncSide, primary *unstructured.Unstructured, projectedGVK schema.GroupVersionKind, selector labels.Selector, keep sets.Set[string], deleteAll bool) (requeue bool, err error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetAPIVersion(projectedGVK.GroupVersion().String())
+	list.SetKind(projectedGVK.Kind + "List")
+
+	// List cluster-wide (across all namespaces). A related resource can map its copies into a
+	// namespace other than the primary's (via spec.object.namespace rewrites), so scoping the List
+	// to a single namespace would miss — and therefore never prune — copies that landed elsewhere.
+	// The label selector already scopes the result to this primary + identifier + agent, so only
+	// copies this agent created for this primary can match.
+	listOpts := []ctrlruntimeclient.ListOption{
+		ctrlruntimeclient.MatchingLabelsSelector{Selector: selector},
+	}
+
+	if err := dest.client.List(ctx, list, listOpts...); err != nil {
+		return false, fmt.Errorf("failed to list related copies: %w", err)
+	}
+
+	recorder := recorderFromContext(ctx)
+
+	for i := range list.Items {
+		item := &list.Items[i]
+
+		if !deleteAll && keep.Has(relatedCopyKey(item.GetNamespace(), item.GetName())) {
+			continue
+		}
+
+		// already being deleted; come back once it is gone.
+		if item.GetDeletionTimestamp() != nil {
+			requeue = true
+			continue
+		}
+
+		log.Debugw("Pruning related object copy…", "namespace", item.GetNamespace(), "name", item.GetName())
+		if err := dest.client.Delete(ctx, item); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+
+			return false, fmt.Errorf("failed to delete related copy: %w", err)
+		}
+
+		if recorder != nil {
+			recorder.Eventf(primary, corev1.EventTypeNormal, "ObjectCleanup", "Deleted orphaned copy %s/%s of a related resource.", item.GetNamespace(), item.GetName())
+		}
+
+		requeue = true
+	}
+
 	return requeue, nil
+}
+
+// liveReadClient serves reads from an uncached reader (hitting the API server directly) while
+// borrowing the RESTMapper, scheme and everything else from an underlying cached client. It lets a
+// destructive prune re-run the origin resolution against the API server instead of trusting a
+// possibly-stale informer cache, without duplicating the resolution logic.
+type liveReadClient struct {
+	ctrlruntimeclient.Client
+	reader ctrlruntimeclient.Reader
+}
+
+func (c *liveReadClient) Get(ctx context.Context, key ctrlruntimeclient.ObjectKey, obj ctrlruntimeclient.Object, opts ...ctrlruntimeclient.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+
+func (c *liveReadClient) List(ctx context.Context, list ctrlruntimeclient.ObjectList, opts ...ctrlruntimeclient.ListOption) error {
+	return c.reader.List(ctx, list, opts...)
+}
+
+// confirmOriginEmpty re-runs the origin resolution against a live (uncached) reader to double-check
+// a cache-driven empty resolution before a MatchOrigin prune deletes all copies of a related
+// resource. It returns checked=false when no live reader is configured for the origin side, in
+// which case the caller must not treat the emptiness as authoritative. When a reader is configured,
+// confirmedEmpty reports whether the live resolution also yields no objects.
+func (s *ResourceSyncer) confirmOriginEmpty(ctx context.Context, origin, dest syncSide, relRes syncagentv1alpha1.RelatedResourceSpec) (confirmedEmpty bool, checked bool, err error) {
+	var reader ctrlruntimeclient.Reader
+	if relRes.Origin == syncagentv1alpha1.RelatedResourceOriginService {
+		reader = s.localAPIReader
+	} else {
+		reader = s.remoteAPIReader
+	}
+
+	if reader == nil {
+		return false, false, nil
+	}
+
+	liveOrigin := syncSide{
+		clusterName: origin.clusterName,
+		client:      &liveReadClient{Client: origin.client, reader: reader},
+		object:      origin.object,
+	}
+
+	resolved, err := resolveRelatedResourceObjects(ctx, liveOrigin, dest, relRes)
+	if err != nil {
+		return false, true, err
+	}
+
+	return len(resolved) == 0, true, nil
 }
 
 // resolvedObject is the result of following the configuration of a related resources. It contains

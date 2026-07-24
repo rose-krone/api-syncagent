@@ -209,6 +209,61 @@ func TestValidateRelatedResourceSpec(t *testing.T) {
 				SyncStatus: true,
 			},
 		},
+		{
+			name:  "cleanupPolicy MatchOrigin with origin service requires watch",
+			valid: false,
+			spec: syncagentv1alpha1.RelatedResourceSpec{
+				Origin:        syncagentv1alpha1.RelatedResourceOriginService,
+				Resource:      "things",
+				Version:       "v1",
+				CleanupPolicy: syncagentv1alpha1.RelatedResourceCleanupPolicyMatchOrigin,
+			},
+		},
+		{
+			name:  "cleanupPolicy MatchOrigin with origin service and watch is valid",
+			valid: true,
+			spec: syncagentv1alpha1.RelatedResourceSpec{
+				Origin:        syncagentv1alpha1.RelatedResourceOriginService,
+				Resource:      "things",
+				Version:       "v1",
+				CleanupPolicy: syncagentv1alpha1.RelatedResourceCleanupPolicyMatchOrigin,
+				Watch: &syncagentv1alpha1.RelatedResourceWatch{
+					ByOwner: &syncagentv1alpha1.RelatedResourceWatchByOwner{},
+				},
+			},
+		},
+		{
+			name:  "cleanupPolicy MatchOrigin with origin kcp does not require watch",
+			valid: true,
+			spec: syncagentv1alpha1.RelatedResourceSpec{
+				Origin:        syncagentv1alpha1.RelatedResourceOriginKcp,
+				Resource:      "things",
+				Version:       "v1",
+				CleanupPolicy: syncagentv1alpha1.RelatedResourceCleanupPolicyMatchOrigin,
+			},
+		},
+		{
+			name:  "cleanup true conflicts with cleanupPolicy Orphan",
+			valid: false,
+			spec: syncagentv1alpha1.RelatedResourceSpec{
+				Origin:        syncagentv1alpha1.RelatedResourceOriginService,
+				Resource:      "things",
+				Version:       "v1",
+				Cleanup:       true,
+				CleanupPolicy: syncagentv1alpha1.RelatedResourceCleanupPolicyOrphan,
+			},
+		},
+		{
+			name:  "cleanup true with cleanupPolicy OnPrimaryDeletion is valid",
+			valid: true,
+			spec: syncagentv1alpha1.RelatedResourceSpec{
+				Origin:        syncagentv1alpha1.RelatedResourceOriginService,
+				Resource:      "things",
+				Version:       "v1",
+				Cleanup:       true,
+				CleanupPolicy: syncagentv1alpha1.RelatedResourceCleanupPolicyOnPrimaryDeletion,
+			},
+		},
 	}
 
 	alphaNum := regexp.MustCompile(`[^a-z0-9]`)
@@ -218,12 +273,22 @@ func TestValidateRelatedResourceSpec(t *testing.T) {
 			crdName := strings.ToLower(tt.name)
 			crdName = alphaNum.ReplaceAllLiteralString(crdName, "-")
 
+			spec := tt.spec
+
+			// Identifier is required and validated as a label value. None of these cases exercise
+			// identifier validation itself, so give them a valid identifier unless they set their
+			// own; otherwise the identifier pattern would reject the spec before the rule actually
+			// under test is reached.
+			if spec.Identifier == "" {
+				spec.Identifier = "test-identifier"
+			}
+
 			pubRes := &syncagentv1alpha1.PublishedResource{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-" + crdName,
 				},
 				Spec: syncagentv1alpha1.PublishedResourceSpec{
-					Related: []syncagentv1alpha1.RelatedResourceSpec{tt.spec},
+					Related: []syncagentv1alpha1.RelatedResourceSpec{spec},
 				},
 			}
 

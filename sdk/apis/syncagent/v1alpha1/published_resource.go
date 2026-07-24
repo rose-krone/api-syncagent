@@ -201,6 +201,25 @@ const (
 	RelatedResourceOriginKcp     RelatedResourceOrigin = "kcp"
 )
 
+// RelatedResourceCleanupPolicy controls when the syncagent deletes the destination copies of a
+// related resource. The original object on the origin side is never deleted, regardless of the
+// chosen policy.
+//
+// +kubebuilder:validation:Enum=Orphan;OnPrimaryDeletion;MatchOrigin
+type RelatedResourceCleanupPolicy string
+
+const (
+	// RelatedResourceCleanupPolicyOrphan never deletes copies (default; == legacy cleanup:false).
+	RelatedResourceCleanupPolicyOrphan RelatedResourceCleanupPolicy = "Orphan"
+	// RelatedResourceCleanupPolicyOnPrimaryDeletion deletes copies only when the primary object
+	// is deleted (== legacy cleanup:true).
+	RelatedResourceCleanupPolicyOnPrimaryDeletion RelatedResourceCleanupPolicy = "OnPrimaryDeletion"
+	// RelatedResourceCleanupPolicyMatchOrigin keeps the destination set equal to the origin set:
+	// a copy is pruned as soon as its origin object is gone, and all copies are deleted when the
+	// primary object is deleted.
+	RelatedResourceCleanupPolicyMatchOrigin RelatedResourceCleanupPolicy = "MatchOrigin"
+)
+
 // RelatedResourceSpec describes a single related resource, which might point to
 // any number of actual Kubernetes objects.
 //
@@ -211,11 +230,19 @@ const (
 // group is included here because when an identityHash is used, core/v1 cannot possible be targetted
 // +kubebuilder:validation:XValidation:rule="!has(self.identityHash) || (has(self.group) && has(self.version) && has(self.resource))",message="identity hashes can only be used with GVRs"
 // +kubebuilder:validation:XValidation:rule="!(self.origin == 'service' && has(self.syncStatus) && self.syncStatus) || has(self.watch)",message="watch must be configured when origin is service and syncStatus is true"
+// +kubebuilder:validation:XValidation:rule="!(has(self.cleanupPolicy) && self.cleanupPolicy == 'MatchOrigin' && self.origin == 'service') || has(self.watch)",message="watch must be configured when cleanupPolicy is MatchOrigin and origin is service"
+// +kubebuilder:validation:XValidation:rule="!(has(self.cleanup) && self.cleanup && has(self.cleanupPolicy) && self.cleanupPolicy == 'Orphan')",message="cleanup:true conflicts with cleanupPolicy: Orphan"
 type RelatedResourceSpec struct {
 	// Identifier is a unique name for this related resource. The name must be unique within one
 	// PublishedResource and is the key by which consumers (end users) can identify and consume the
 	// related resource. Common names are "connection-details" or "credentials".
-	// The identifier must be an alphanumeric string.
+	//
+	// The identifier is used verbatim as a label value on the synced copies of the related resource,
+	// so it must be a valid label value: a lowercase RFC 1123 label consisting of lowercase
+	// alphanumeric characters or '-', starting and ending with an alphanumeric character, and at
+	// most 63 characters long.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Identifier string `json:"identifier"`
 
 	// +kubebuilder:validation:Enum=service;kcp
@@ -248,7 +275,23 @@ type RelatedResourceSpec struct {
 	// the destination side (i.e. the original related object will not be touched, regardless of this
 	// option). Leaving this disabled, the syncagent will only create copies of the related objects,
 	// but never delete them itself.
+	//
+	// Deprecated: use CleanupPolicy instead. When CleanupPolicy is empty, cleanup:true is treated
+	// as OnPrimaryDeletion and cleanup:false as Orphan.
 	Cleanup bool `json:"cleanup,omitempty"`
+
+	// CleanupPolicy controls when the syncagent deletes destination copies of this related
+	// resource. The original object on the origin side is never deleted.
+	//
+	//   - Orphan (default): copies are never deleted by the agent.
+	//   - OnPrimaryDeletion: copies are deleted only when the primary object is deleted.
+	//   - MatchOrigin: copies are pruned as soon as their origin object no longer exists, and
+	//     all copies are deleted when the primary object is deleted.
+	//
+	// When left empty, the deprecated Cleanup field is used to derive the effective policy.
+	//
+	// +optional
+	CleanupPolicy RelatedResourceCleanupPolicy `json:"cleanupPolicy,omitempty"`
 
 	// Projection is used to change the GVK of a related resource on the opposite side of
 	// its origin.
@@ -283,6 +326,21 @@ type RelatedResourceSpec struct {
 	//
 	// +optional
 	SyncStatus bool `json:"syncStatus,omitempty"`
+}
+
+// EffectiveCleanupPolicy normalizes the deprecated Cleanup bool and the CleanupPolicy field into
+// a single effective policy. CleanupPolicy takes precedence; when it is empty, cleanup:true maps
+// to OnPrimaryDeletion and cleanup:false to Orphan.
+func (r *RelatedResourceSpec) EffectiveCleanupPolicy() RelatedResourceCleanupPolicy {
+	if r.CleanupPolicy != "" {
+		return r.CleanupPolicy
+	}
+
+	if r.Cleanup {
+		return RelatedResourceCleanupPolicyOnPrimaryDeletion
+	}
+
+	return RelatedResourceCleanupPolicyOrphan
 }
 
 // RelatedResourceWatch configures how the watch handler maps a changed related resource

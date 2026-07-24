@@ -57,6 +57,14 @@ type objectSyncer struct {
 	blockSourceDeletion bool
 	// whether or not to place sync-related metadata on the destination object
 	metadataOnDestination bool
+	// destLabels are additional labels stamped onto the destination object on every apply.
+	// Used to attach related-resource provenance (owning primary + identifier) to copies so
+	// that they can later be enumerated and pruned. These are applied additively and never
+	// clobber labels the copy already carries.
+	destLabels map[string]string
+	// destAnnotations are additional annotations stamped onto the destination object on every
+	// apply; the human-facing counterpart to destLabels.
+	destAnnotations map[string]string
 	// optional mutations for both directions of the sync
 	mutator mutation.Mutator
 	// stateStore is capable of remembering the state of a Kubernetes object
@@ -171,6 +179,18 @@ func (s *objectSyncer) Sync(ctx context.Context, log *zap.SugaredLogger, source,
 	if dest.object.GetDeletionTimestamp() != nil {
 		log.Debugw("Destination object is in deletion, skipping any further synchronization", "dest-object", newObjectKey(dest.object, dest.clusterName, logicalcluster.None))
 		return false, nil
+	}
+
+	// Backfill provenance labels/annotations onto copies that predate them: unlike the create, adopt
+	// and Server-Side Apply paths, the client-side-merge update path below never stamps them, so a
+	// copy that already existed when the user opted into a pruning cleanupPolicy would otherwise never
+	// be enumerated for pruning. Requeue after a restamp so the content sync runs on the next pass.
+	restamped, err := s.ensureDestMetadataPersisted(ctx, log, dest)
+	if err != nil {
+		return false, fmt.Errorf("failed to ensure destination metadata: %w", err)
+	}
+	if restamped {
+		return true, nil
 	}
 
 	requeue, err = s.syncObjectContents(ctx, log, source, dest)
@@ -420,6 +440,9 @@ func (s *objectSyncer) applyServerSide(ctx context.Context, log *zap.SugaredLogg
 		s.labelWithAgent(desired)
 	}
 
+	// stamp any additional provenance labels/annotations (e.g. related-resource ownership)
+	s.ensureDestMetadata(desired)
+
 	// do not claim ownership of subresource content via the main resource
 	// apply; status is reconciled separately and "scale" is never written.
 	s.removeSubresources(desired)
@@ -503,6 +526,9 @@ func (s *objectSyncer) ensureDestinationObject(ctx context.Context, log *zap.Sug
 		s.labelWithAgent(destObj)
 	}
 
+	// stamp any additional provenance labels/annotations (e.g. related-resource ownership)
+	s.ensureDestMetadata(destObj)
+
 	// finally, we can create the destination object
 	objectLog := log.With("dest-object", newObjectKey(destObj, dest.clusterName, logicalcluster.None))
 	objectLog.Debugw("Creating destination object…")
@@ -551,6 +577,7 @@ func (s *objectSyncer) adoptExistingDestinationObject(ctx context.Context, log *
 	ensureAnnotations(existingDestObj, sourceKey.Annotations())
 
 	s.labelWithAgent(existingDestObj)
+	s.ensureDestMetadata(existingDestObj)
 
 	if err := dest.client.Update(ctx, existingDestObj); err != nil {
 		return fmt.Errorf("failed to upsert current destination object labels: %w", err)
@@ -653,4 +680,45 @@ func (s *objectSyncer) labelWithAgent(obj *unstructured.Unstructured) {
 	if s.agentName != "" {
 		ensureLabels(obj, map[string]string{agentNameLabel: s.agentName})
 	}
+}
+
+// ensureDestMetadata stamps the syncer's additional destination labels/annotations onto the given
+// object. It is additive (it never removes labels the object already carries) and is used to
+// attach related-resource provenance to destination copies.
+func (s *objectSyncer) ensureDestMetadata(obj *unstructured.Unstructured) {
+	if len(s.destLabels) > 0 {
+		ensureLabels(obj, s.destLabels)
+	}
+
+	if len(s.destAnnotations) > 0 {
+		ensureAnnotations(obj, s.destAnnotations)
+	}
+}
+
+// ensureDestMetadataPersisted makes sure the additional destination labels/annotations are present
+// on an already-existing destination object, patching it if they are missing. New copies are stamped
+// at creation time (ensureDestinationObject) or when adopted, and the Server-Side Apply path restamps
+// on every apply, but the client-side-merge update path (syncObjectSpec) does not touch them. Without
+// this, a copy that already existed when the user opted into a pruning cleanupPolicy would never
+// receive the provenance labels the prune relies on and could therefore never be reclaimed. The
+// operation is idempotent: once the labels are present, the diff is empty and no patch is issued.
+func (s *objectSyncer) ensureDestMetadataPersisted(ctx context.Context, log *zap.SugaredLogger, dest syncSide) (updated bool, err error) {
+	if len(s.destLabels) == 0 && len(s.destAnnotations) == 0 {
+		return false, nil
+	}
+
+	original := dest.object.DeepCopy()
+	s.ensureDestMetadata(dest.object)
+
+	if equality.Semantic.DeepEqual(original.GetLabels(), dest.object.GetLabels()) &&
+		equality.Semantic.DeepEqual(original.GetAnnotations(), dest.object.GetAnnotations()) {
+		return false, nil
+	}
+
+	log.Debugw("Restamping provenance metadata on existing destination object…", "dest-object", newObjectKey(dest.object, dest.clusterName, logicalcluster.None))
+	if err := dest.client.Patch(ctx, dest.object, ctrlruntimeclient.MergeFrom(original)); err != nil {
+		return false, fmt.Errorf("failed to restamp destination metadata: %w", err)
+	}
+
+	return true, nil
 }

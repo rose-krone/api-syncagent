@@ -65,6 +65,7 @@ const (
 
 type Reconciler struct {
 	localClient           ctrlruntimeclient.Client
+	localAPIReader        ctrlruntimeclient.Reader
 	remoteManager         mcmanager.Manager
 	log                   *zap.SugaredLogger
 	remoteDummy           *unstructured.Unstructured
@@ -120,6 +121,7 @@ func Create(
 	// setup the reconciler
 	reconciler := &Reconciler{
 		localClient:           localManager.GetClient(),
+		localAPIReader:        localManager.GetAPIReader(),
 		remoteManager:         remoteManager,
 		log:                   log,
 		remoteDummy:           remoteDummy,
@@ -360,6 +362,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request mcreconcile.Request)
 		return reconcile.Result{}, fmt.Errorf("failed to get cluster: %w", err)
 	}
 	vwClient := cl.GetClient()
+	vwAPIReader := cl.GetAPIReader()
 
 	remoteObj := r.remoteDummy.DeepCopy()
 	if err := vwClient.Get(ctx, request.NamespacedName, remoteObj); ctrlruntimeclient.IgnoreNotFound(err) != nil {
@@ -410,7 +413,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, request mcreconcile.Request)
 		ctx = sync.WithWorkspacePath(ctx, logicalcluster.NewPath(path))
 	}
 
-	var syncerOpts []sync.ResourceSyncerOption
+	// pass uncached readers so a MatchOrigin prune can re-confirm an empty origin resolution
+	// against the API server before deleting all copies of a related resource.
+	syncerOpts := []sync.ResourceSyncerOption{
+		sync.WithLiveReaders(r.localAPIReader, vwAPIReader),
+	}
 	if r.enableServerSideApply {
 		syncerOpts = append(syncerOpts, sync.WithServerSideApply())
 	}
