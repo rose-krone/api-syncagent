@@ -88,7 +88,7 @@ func (s *ResourceSyncer) processRelatedResource(ctx context.Context, log *zap.Su
 	policy := relRes.EffectiveCleanupPolicy()
 
 	// find the all objects on the origin side that match the given criteria
-	resolvedObjects, err := resolveRelatedResourceObjects(ctx, origin, dest, relRes)
+	resolvedObjects, err := resolveRelatedResourceObjects(ctx, log, origin, dest, relRes)
 	if err != nil {
 		return false, fmt.Errorf("failed to get resolve origin objects: %w", err)
 	}
@@ -479,7 +479,7 @@ func (s *ResourceSyncer) confirmOriginEmpty(ctx context.Context, origin, dest sy
 		object:      origin.object,
 	}
 
-	resolved, err := resolveRelatedResourceObjects(ctx, liveOrigin, dest, relRes)
+	resolved, err := resolveRelatedResourceObjects(ctx, s.log, liveOrigin, dest, relRes)
 	if err != nil {
 		return false, true, err
 	}
@@ -495,7 +495,7 @@ type resolvedObject struct {
 	destination types.NamespacedName
 }
 
-func resolveRelatedResourceObjects(ctx context.Context, relatedOrigin, relatedDest syncSide, relRes syncagentv1alpha1.RelatedResourceSpec) ([]resolvedObject, error) {
+func resolveRelatedResourceObjects(ctx context.Context, log *zap.SugaredLogger, relatedOrigin, relatedDest syncSide, relRes syncagentv1alpha1.RelatedResourceSpec) ([]resolvedObject, error) {
 	// resolving the originNamespace first allows us to scope down any .List() calls later
 	originNamespace := relatedOrigin.object.GetNamespace()
 	destNamespace := relatedDest.object.GetNamespace()
@@ -529,7 +529,7 @@ func resolveRelatedResourceObjects(ctx context.Context, relatedOrigin, relatedDe
 	// this related resource configuration. Again, for label selectors this can be multiple,
 	// otherwise at most 1.
 
-	objects, err := resolveRelatedResourceObjectsInNamespaces(ctx, relatedOrigin, relatedDest, relRes, relRes.Object.RelatedResourceObjectSpec, namespaceMap)
+	objects, err := resolveRelatedResourceObjectsInNamespaces(ctx, log, relatedOrigin, relatedDest, relRes, relRes.Object.RelatedResourceObjectSpec, namespaceMap)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve objects: %w", err)
 	}
@@ -630,7 +630,7 @@ func mapSlices(a, b []string) map[string]string {
 	return mapping
 }
 
-func resolveRelatedResourceObjectsInNamespaces(ctx context.Context, relatedOrigin, relatedDest syncSide, relRes syncagentv1alpha1.RelatedResourceSpec, spec syncagentv1alpha1.RelatedResourceObjectSpec, namespaceMap map[string]string) ([]resolvedObject, error) {
+func resolveRelatedResourceObjectsInNamespaces(ctx context.Context, log *zap.SugaredLogger, relatedOrigin, relatedDest syncSide, relRes syncagentv1alpha1.RelatedResourceSpec, spec syncagentv1alpha1.RelatedResourceObjectSpec, namespaceMap map[string]string) ([]resolvedObject, error) {
 	result := []resolvedObject{}
 
 	for originNamespace, destNamespace := range namespaceMap {
@@ -653,9 +653,22 @@ func resolveRelatedResourceObjectsInNamespaces(ctx context.Context, relatedOrigi
 
 			err = relatedOrigin.client.Get(ctx, types.NamespacedName{Name: originName, Namespace: originNamespace}, originObj)
 			if err != nil {
-				// this should rarely happen, only if an object was deleted in between the .List() call
-				// above and the .Get() call here.
+				// This should rarely happen, only if an object was deleted in between the .List()
+				// call above and the .Get() call here. It can also happen permanently if a
+				// misconfigured object.template/reference/selector computes a name that never
+				// matches a real object - in that case this branch is hit on every single
+				// reconcile, forever, with the primary object's reconcile otherwise reporting
+				// success. Log it so that case is diagnosable without reading the source.
 				if apierrors.IsNotFound(err) {
+					if log != nil {
+						log.Debugw(
+							"Origin object for related resource not found, skipping",
+							"identifier", relRes.Identifier,
+							"namespace", originNamespace,
+							"name", originName,
+						)
+					}
+
 					continue
 				}
 
