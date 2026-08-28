@@ -659,15 +659,13 @@ func resolveRelatedResourceObjectsInNamespaces(ctx context.Context, log *zap.Sug
 				// matches a real object - in that case this branch is hit on every single
 				// reconcile, forever, with the primary object's reconcile otherwise reporting
 				// success. Log it so that case is diagnosable without reading the source.
-				if apierrors.IsNotFound(err) {
-					if log != nil {
+				if apierrors.IsNotFound(err) {					
 						log.Debugw(
 							"Origin object for related resource not found, skipping",
 							"identifier", relRes.Identifier,
 							"namespace", originNamespace,
 							"name", originName,
-						)
-					}
+						)					
 
 					continue
 				}
